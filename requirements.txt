@@ -1,6 +1,5 @@
 cuquantum
 cuquantum-python
-cupy
 matplotlib
 numpy
 qiskit-aer-gpu
