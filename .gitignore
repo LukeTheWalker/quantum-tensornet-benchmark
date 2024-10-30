@@ -162,3 +162,5 @@ cython_debug/
 # Custom
 benchmark_results
 pictures
+circuits_chonky
+circuits_single
