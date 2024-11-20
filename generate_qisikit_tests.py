@@ -5,11 +5,14 @@ from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 from qiskit.circuit.random import random_circuit
 from tqdm import tqdm
+import networkx as nx
+import matplotlib.pyplot as plt
 
 class Gate:
-    def __init__(self, qubits, unitary):
+    def __init__(self, qubits, unitary, name=None):
         self.qubits = qubits  # span of qubits on which the gate acts
         self.unitary = unitary  # unitary matrix representing the gate
+        self.name = name
 
     def __repr__(self):
         return f'Gate(qubits={self.qubits}, unitary=\n{self.unitary})'
@@ -21,8 +24,19 @@ class TreeNode:
         self.span = None if gate is None else gate.qubits
         self.gate = gate
 
+
     def __repr__(self):
-        return f'TreeNode(span={self.span}, left={self.left}, right={self.right})'
+        def build_tree_str(node, prefix=""):
+            if node is None:
+                return f"{prefix}None\n"
+            result = f"{prefix}TreeNode(span={node.span}, gate={node.gate.name if node.gate else None})\n"
+            if node.left or node.right:  # If there are children
+                result += build_tree_str(node.left, prefix + "    ")
+                result += build_tree_str(node.right, prefix + "    ")
+            return result
+        
+        return build_tree_str(self)        
+
     
 def remap_qubits(qubits):
     sorted_unique = sorted(set(qubits))
@@ -37,26 +51,134 @@ def get_gate_list(qc):
     for instruction in qc.data:
         gate_operation = instruction.operation
         qubits = [qubit._index for qubit in instruction.qubits]
-        gates_list.append(Gate(qubits, instruction.matrix))
+        gates_list.append(Gate(qubits, instruction.matrix, gate_operation.name))
 
     return gates_list
 
-def build_tree(node_list):
-    while len(node_list) > 1:
+def build_tree(node_list, n_qubits):
+    def create_dag_from_spans(node_list):
+        graph = nx.DiGraph()
+
+        for i, node in enumerate(node_list):
+            if node.span is not None:
+                graph.add_node(i, label='Gate' if node.gate else 'Contraction', span=node.span, node=node, pos=i, name=node.gate.name if node.gate else None)
+            else:
+                print('Node without span:', node)
+                exit(1)
+            
+        # print('Graph nodes:', graph.nodes.data())
+            
         for i in range(len(node_list) - 1):
-            if node_list[i].span is None or node_list[i + 1].span is None:
+            for j in range(i + 1, len(node_list)):
+                # print('Checking nodes...', i, j)
+                own_lanes = set(node_list[i].span)
+                other_lanes = set(node_list[j].span)
+                common_lanes = own_lanes.intersection(node_list[j].span)
+                if common_lanes:
+                    compatiblesx_to_dx = all(not any(q in node_list[k].span for k in range(i + 1, j)) for q in own_lanes)
+                    compatibledx_to_sx = all(not any(q in node_list[k].span for k in range(i + 1, j)) for q in other_lanes)
+                    if compatiblesx_to_dx:
+                        graph.add_edge(i, j)
+                    if compatibledx_to_sx:
+                        graph.add_edge(j, i)
+
+        # print('Graph edges:', graph.edges)
+
+        return graph
+
+    # Create the DAG from the node list
+    dag = create_dag_from_spans(node_list)
+
+    print(dag.edges)
+
+    # save dag png to file
+    fig = plt.figure()
+    pos = nx.spring_layout(dag)
+    labels = nx.get_node_attributes(dag, 'name')
+    nx.draw(dag, pos, labels=labels, with_labels=True, ax=fig.add_subplot())
+    plt.savefig('dag.png')
+
+
+    id_cnt = len(node_list)
+
+    for contracting_size in range(1, n_qubits + 1):
+        queue = [node for node in dag.nodes if len(dag.nodes[node]['span']) == contracting_size]
+        # print('Queue:', queue)
+        while queue:
+            node = queue.pop(0)
+            neighbors = list(dag.neighbors(node))
+            # print(f"Analyzing node {node} with neighbors {neighbors}")
+            if len(neighbors) == 0:
+                print("ERRORE: nodo senza vicini")
                 continue
 
-            if len(set(node_list[i].span).intersection(node_list[i + 1].span)) > 0:
-                new_node = TreeNode()
-                new_node.left  = node_list[i]
-                new_node.right = node_list[i + 1]
-                new_node.span = list(set(node_list[i].span).union(node_list[i + 1].span))
-                node_list[i] = new_node
-                node_list.pop(i + 1)
-                break
+            sorted_neighbours_by_span_size = sorted(neighbors, key=lambda x: len(set(dag.nodes[node]['span']).union(set(dag.nodes[x]['span']))))
+            neighbor = sorted_neighbours_by_span_size[0]
+            # for neighbor in sorted_neighbours_by_span_size:
+            # if len(dag.nodes[neighbor]['span']) <= contracting_size:
+            print("Contracting nodes", node, neighbor)
+            new_span = sorted(set(dag.nodes[node]['span']).union(dag.nodes[neighbor]['span']))
+            new_node = TreeNode()
+            new_node.span = new_span
 
-    return node_list[0]
+            left_node  = dag.nodes[node]     if dag.nodes[node]['pos'] < dag.nodes[neighbor]['pos'] else dag.nodes[neighbor]
+            right_node = dag.nodes[neighbor] if dag.nodes[node]['pos'] < dag.nodes[neighbor]['pos'] else dag.nodes[node]
+
+            new_node.left = left_node['node']
+            new_node.right = right_node['node']
+
+            new_pos = dag.nodes[neighbor]['pos']
+
+            dag.add_node(id_cnt, label='Contraction', span=new_span, node=new_node, pos=new_pos, name="Contraction")
+            
+            # check with all the other nodes if the new node can be contracted
+            # for id, other_node in dag.nodes(data=True):
+            #     if id == id_cnt:
+            #         continue
+            #     if other_node['pos'] >= new_pos:
+            #         own_lanes = set(new_node.span)
+            #         other_lanes = set(other_node['span'])
+            #     else:
+            #         own_lanes = set(other_node['span'])
+            #         other_lanes = set(new_node.span)
+            #     common_lanes = own_lanes.intersection(other_node['span'])
+            #     if common_lanes:
+            #         compatible = all(not any(q in node_list[k].span for k in range(new_pos + 1, other_node['pos'])) for q in other_lanes)
+            #         if compatible:
+            #             dag.add_edge(id, id_cnt)
+
+            print("Adding edges to the new node")
+
+            for ee in dag.in_edges(left_node):
+                dag.add_edge(ee[0], id_cnt)
+                dag.add_edge(id_cnt, ee[1])
+            
+            for ee in dag.in_edges(right_node):
+                dag.add_edge(ee[0], id_cnt)
+                dag.add_edge(id_cnt, ee[1])
+            
+            for ee in dag.out_edges(left_node):
+                dag.add_edge(ee[0], id_cnt)
+                dag.add_edge(id_cnt, ee[1])
+            
+            for ee in dag.out_edges(right_node):
+                dag.add_edge(ee[0], id_cnt)
+                dag.add_edge(id_cnt, ee[1])
+
+            dag.remove_node(node)
+            dag.remove_node(neighbor)
+
+            if neighbor in queue:
+                queue.remove(neighbor)
+            if len(new_node.span) == contracting_size:
+                queue.append(id_cnt)
+            # print(f"Node {id_cnt} has neighbors {list(dag.neighbors(id_cnt))}")
+            id_cnt += 1
+            print('Graph edges after deleting node:', dag.edges)
+                # break
+    # print(dag.nodes)
+
+    return dag.nodes()[id_cnt - 1]['node']
 
 def get_contraction_tree(qc):
     gates_list = get_gate_list(qc)
@@ -193,25 +315,50 @@ def get_unitary_with_qiskit(qc):
 
 def main (db_filename):
     seed = 42
-    num_qubits_range = range(5, 11)
+    num_qubits_range = range(5, 6)
     depth_range = range(100, 301, 10)
 
-    backend = AerSimulator(method='unitary', device='GPU')
+    # num_qubits_range = range(4, 5)
+    # depth_range = range(3, 4)
+
+    # backend = AerSimulator(method='unitary', device='GPU')
 
     initialize_db(db_filename)
 
-    for qubit_count in tqdm(num_qubits_range, desc="Qubit Count Progress"):
-        for depth in tqdm(depth_range, desc="Depth Progress", leave=False):
-            circuit = random_circuit(num_qubits=qubit_count, depth=depth, max_operands=4, measure=False, seed=seed)
+    # for qubit_count in tqdm(num_qubits_range, desc="Qubit Count Progress"):
+    #     for depth in tqdm(depth_range, desc="Depth Progress", leave=False):
 
-            gate_list = get_gate_list(circuit)
+    # circuit = QuantumCircuit(4)
 
-            node_list = [TreeNode(gate) for gate in gate_list] 
+    # # Add the gates
+    # circuit.h(0)  # Hadamard gate on q_0
+    # circuit.cp(2.7861, 0, 1)  # Controlled-Phase gate
+    # circuit.rz(2.2276, 1)  # Rz rotation on q_1
+    # circuit.mcx([1, 2, 3], 0)  # Multi-controlled-X (Toffoli) gate
 
-            root = build_tree(node_list)
+    # qubit_count = circuit.num_qubits
+    # depth = circuit.depth()
 
-            unitary_matrix, qiskit_unitary_gpu_time = get_unitary_with_qiskit(circuit)
-            program_id = put_circuit_into_db(db_filename, root, qiskit_unitary_gpu_time, unitary_matrix, qubit_count, depth)
+    # # Draw the circuit
+    # print(circuit)
+
+    qubit_count = 5
+    depth = 3
+
+    circuit = random_circuit(num_qubits=qubit_count, depth=depth, max_operands=4, measure=False, seed=seed)
+
+    print(circuit)
+
+    gate_list = get_gate_list(circuit)
+
+    node_list = [TreeNode(gate) for gate in gate_list] 
+
+    root = build_tree(node_list, qubit_count)
+
+    print (root)
+
+    unitary_matrix, qiskit_unitary_gpu_time = get_unitary_with_qiskit(circuit)
+    program_id = put_circuit_into_db(db_filename, root, qiskit_unitary_gpu_time, unitary_matrix, qubit_count, depth)
 
 
 if __name__ == '__main__':
