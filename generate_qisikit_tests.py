@@ -4,9 +4,12 @@ import os
 from qiskit import QuantumCircuit, transpile    
 from qiskit_aer import AerSimulator
 from qiskit.circuit.random import random_circuit
+from qiskit.quantum_info import random_unitary
 from tqdm import tqdm
 import networkx as nx
 import matplotlib.pyplot as plt
+import numpy as np
+import argparse
 
 class Gate:
     def __init__(self, qubits, unitary, name=None):
@@ -55,6 +58,7 @@ def get_gate_list(qc):
 
     return gates_list
 
+'''
 def build_tree(node_list, n_qubits):
     def create_dag_from_spans(node_list):
         graph = nx.DiGraph()
@@ -179,6 +183,8 @@ def build_tree(node_list, n_qubits):
     # print(dag.nodes)
 
     return dag.nodes()[id_cnt - 1]['node']
+'''
+
 
 def get_contraction_tree(qc):
     gates_list = get_gate_list(qc)
@@ -230,9 +236,9 @@ def initialize_db(db_filename):
                     filename TEXT NOT NULL,
                     n_qubits INTEGER DEFAULT NULL,
                     depth INTEGER DEFAULT NULL,
-                    qiskit_unitary_gpu_time INTEGER DEFAULT NULL,
+                    qiskit_unitary_gpu_time_ms INTEGER DEFAULT NULL,
                     unitary_matrix BLOB DEFAULT NULL,
-                    tree_building_time_us INTEGER DEFAULT NULL
+                    tree_building_time_ms INTEGER DEFAULT NULL
                 )''')
 
     # Commit changes and close the connection
@@ -241,16 +247,15 @@ def initialize_db(db_filename):
 
 
 
-def put_circuit_into_db(db_filename, root, qiskit_unitary_gpu_time, unitary_matrix, n_qubits, depth):
+def put_circuit_into_db(db_filename, root, qiskit_unitary_gpu_time_ms, tree_building_time_ms, unitary_matrix, n_qubits, depth):
     conn = sqlite3.connect(db_filename)
     c = conn.cursor()
 
     # insert a program into the db
     filename = 'test.qasm'
     text = "NULL"
-    qiskit_unitary_gpu_time *= 1e3
 
-    c.execute('''INSERT INTO programs (filename, qiskit_unitary_gpu_time, unitary_matrix, n_qubits, depth) VALUES (?, ?, ?, ?, ?)''', (filename, qiskit_unitary_gpu_time, unitary_matrix.data.tobytes(), n_qubits, depth))
+    c.execute('''INSERT INTO programs (filename, qiskit_unitary_gpu_time_ms, tree_building_time_ms, unitary_matrix, n_qubits, depth) VALUES (?, ?, ?, ?, ?, ?)''', (filename, qiskit_unitary_gpu_time_ms, tree_building_time_ms, unitary_matrix.data.tobytes(), n_qubits, depth))
     program_id = c.lastrowid
 
     # insert the tree into the db
@@ -298,20 +303,53 @@ def put_circuit_into_db(db_filename, root, qiskit_unitary_gpu_time, unitary_matr
 def get_unitary_with_qiskit(qc):
     simulator = AerSimulator(method='unitary', device='GPU')
 
-    start_time = time.time()
-
     qc.save_unitary()
     transpiled_circuit = transpile(qc, simulator)
+
+    start_time = time.time()
+
     job = simulator.run(transpiled_circuit)
     result = job.result()
-    end_time = time.time()
     unitary_matrix = result.get_unitary(transpiled_circuit)
 
-    execution_time_ms = (end_time - start_time)
+    end_time = time.time()
+
+    execution_time_ms = (end_time - start_time) * 1000
 
     return unitary_matrix, execution_time_ms
 
+def build_tree(node_list):
+    # iterate the list, when you find two consecutive gates having some qubits in common, create a new node with these gates as children and remove them from the list
 
+    while len(node_list) > 1:
+        for i in range(len(node_list) - 1):
+            if node_list[i].span is None or node_list[i + 1].span is None:
+                continue
+
+            if len(set(node_list[i].span).intersection(node_list[i + 1].span)) > 0:
+                new_node = TreeNode()
+                new_node.left  = node_list[i]
+                new_node.right = node_list[i + 1]
+                new_node.span = list(set(node_list[i].span).union(node_list[i + 1].span))
+                node_list[i] = new_node
+                node_list.pop(i + 1)
+                break
+
+    return node_list[0]
+
+def process_circuit(circuit, db_filename):
+    gate_list = get_gate_list(circuit)
+
+    node_list = [TreeNode(gate) for gate in gate_list] 
+
+    start = time.time()
+    root = build_tree(node_list)
+    tree_building_time_ms = (time.time() - start) * 1000
+
+    unitary_matrix, qiskit_unitary_gpu_time_ms = get_unitary_with_qiskit(circuit)
+    program_id = put_circuit_into_db(db_filename, root, qiskit_unitary_gpu_time_ms, tree_building_time_ms, unitary_matrix, circuit.num_qubits, circuit.depth())
+
+    return program_id
 
 def main (db_filename):
     seed = 42
@@ -342,24 +380,76 @@ def main (db_filename):
     # # Draw the circuit
     # print(circuit)
 
-    qubit_count = 5
-    depth = 3
+    # qubit_count = 5
+    # depth = 3
 
-    circuit = random_circuit(num_qubits=qubit_count, depth=depth, max_operands=4, measure=False, seed=seed)
+    # circuit = random_circuit(num_qubits=qubit_count, depth=depth, max_operands=4, measure=False, seed=seed)
 
-    print(circuit)
+    # print(circuit)
 
-    gate_list = get_gate_list(circuit)
+    seed = 42
+    np.random.seed(seed)
 
-    node_list = [TreeNode(gate) for gate in gate_list] 
+    def pick_random_qubits(num_qubits, seed):
+        # choose a random number of qubits from 1 to num_qubits
+        num_qubits_chosen = np.random.randint(1, num_qubits + 1)
+        # choose a random set of qubits
+        qubits = np.random.choice(num_qubits, num_qubits_chosen, replace=False)
+        qubits = sorted([int(q) for q in qubits])
+        return qubits, num_qubits_chosen
 
-    root = build_tree(node_list, qubit_count)
+    def create_random_unitary(num_qubits_chosen, seed):
+        return random_unitary(2**num_qubits_chosen, seed=seed)
 
-    print (root)
 
-    unitary_matrix, qiskit_unitary_gpu_time = get_unitary_with_qiskit(circuit)
-    program_id = put_circuit_into_db(db_filename, root, qiskit_unitary_gpu_time, unitary_matrix, qubit_count, depth)
+    depth = 100
+    qubit_count = 10
 
+    # Create a Quantum Circuit with 2 qubits
+    circuit = QuantumCircuit(qubit_count)
+
+    for _ in range(depth):
+        qubits_chosen, num_qubits_chosen = pick_random_qubits(qubit_count, seed)
+        circuit.unitary(create_random_unitary(num_qubits_chosen, seed), qubits_chosen)
+
+
+    # Draw the circuit
+    circuit.draw('mpl', filename='circuit.png')
+
+    return process_circuit(circuit, db_filename)
+
+def from_quasm_folder(folder_path, db_filename):
+    initialize_db(db_filename)
+
+    last_id = -1
+
+    files = os.listdir(folder_path)
+    for file in tqdm(files):
+        circuit = QuantumCircuit.from_qasm_file(os.path.join(folder_path, file))
+        if circuit.num_qubits > 10:
+            # print(f"Skipping circuit {file} with {circuit.num_qubits} qubits")
+            continue
+        # print(f"Processing circuit {file} with {circuit.num_qubits} qubits")
+        # remove all the measurements
+        circuit.remove_final_measurements()
+        last_id = process_circuit(circuit, db_filename)
+    print(f"Processed {last_id} circuits")
 
 if __name__ == '__main__':
-    main('qiskit.db')
+    parser = argparse.ArgumentParser(description="Process a folder containing QASM files.")
+    parser.add_argument(
+        "--from-quasm-folder",
+        type=str,
+        required=False,
+        help="Path to the folder containing QASM files."
+    )
+    args = parser.parse_args()
+    folder_path = args.from_quasm_folder
+    if folder_path:
+        if not os.path.isdir(folder_path):
+            print(f"Error: The folder '{folder_path}' does not exist.")
+            exit(1)
+        print(f"Processing QASM files from folder '{folder_path}'")
+        from_quasm_folder(folder_path, 'qiskit.db')
+    else:
+        main('qiskit.db')
